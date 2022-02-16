@@ -1,0 +1,7 @@
+bin/
+build/
+*.mod
+*.elf
+*.map
+*.o
+network.h
