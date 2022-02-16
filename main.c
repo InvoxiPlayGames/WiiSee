@@ -24,7 +24,8 @@ static char gFrameReady = 0;
 // the timestamp that the frame was fetched
 static clock_t gFrameTimestamp = 0;
 // our current frame state
-static char gFrameBuffer[0xCA800] = { 0 };
+#define FRAMEBUFFER_MAX_SIZE 0xCA800
+static char gFrameBuffer[FRAMEBUFFER_MAX_SIZE] = { 0 };
 static int gFrameSize = 0;
 static int gFrameHeight = 0;
 static int gFrameWidth = 0;
@@ -46,7 +47,6 @@ static char LZOWorkMem[LZO1X_1_MEM_COMPRESS] = { 0 };
 // Networking code
 #include "network.h"
 #define FB_SEGMENT_SIZE 0x520
-#define FB_COMPRESS_SEGMENT_SIZE (FB_SEGMENT_SIZE + FB_SEGMENT_SIZE / 16 + 64 + 3)
 #define PROTOCOL_VERSION 0x00
 #define WELCOME_CONNECTION 0x00
 #define NEW_FRAME_PACKET 0x01
@@ -56,11 +56,12 @@ typedef struct _NewFrame {
     short Width;
     short Height;
     int FrameSize;
+    int CompressedSize;
     int SegmentSize;
 } NewFrame;
 typedef struct _FrameUpdate {
     int Offset;
-    char Data[FB_COMPRESS_SEGMENT_SIZE];
+    char Data[FB_SEGMENT_SIZE];
 } FrameUpdate;
 typedef struct _Timestamp {
     clock_t RenderTimestamp;
@@ -81,6 +82,7 @@ static struct {
         Timestamp Time;
     } Data;
 } __attribute__((packed)) OutgoingPacket = { 0 };
+static char gFrameBufferCompressed[FRAMEBUFFER_MAX_SIZE + FRAMEBUFFER_MAX_SIZE / 16 + 64 + 3] = { 0 };
 
 static so_ret_t SetNonBlocking(so_fd_t fd) {
 	int fcntl = SOFcntl(fd, F_GETFL, 0);
@@ -132,20 +134,23 @@ static void * HandlingThread(void *a) {
             gFrameReady = 0;
             cClockTime = OSGetTime();
             OutgoingPacket.Head.FrameID = gFrameTimestamp;
+            // compress frame
+            lzo_uint compressedFrameSize = sizeof(gFrameBufferCompressed);
+            lzo1x_1_compress((const unsigned char *)gFrameBuffer, gFrameSize, (unsigned char *)gFrameBufferCompressed, &compressedFrameSize, LZOWorkMem);
             // send new frame packet
             OutgoingPacket.Head.PacketType = NEW_FRAME_PACKET;
-            OutgoingPacket.Data.New.FrameSize = gFrameSize;
-            OutgoingPacket.Data.New.Height = gFrameHeight;
             OutgoingPacket.Data.New.Width = gFrameWidth;
+            OutgoingPacket.Data.New.Height = gFrameHeight;
+            OutgoingPacket.Data.New.FrameSize = gFrameSize;
+            OutgoingPacket.Data.New.CompressedSize = compressedFrameSize;
             OutgoingPacket.Data.New.SegmentSize = FB_SEGMENT_SIZE;
             SOSendTo(gSocket, &OutgoingPacket, sizeof(Header) + sizeof(NewFrame), 0, &sConnectAddr);
             // send frame update packet(s)
             OutgoingPacket.Head.PacketType = FRAME_UPDATE_PACKET;
-            for (int i = 0; i < gFrameSize; i += FB_SEGMENT_SIZE) {
-                lzo_uint destSize = FB_COMPRESS_SEGMENT_SIZE;
+            for (int i = 0; i < compressedFrameSize; i += FB_SEGMENT_SIZE) {
                 OutgoingPacket.Data.Update.Offset = i;
-                lzo1x_1_compress((const unsigned char *)gFrameBuffer + i, FB_SEGMENT_SIZE, (unsigned char *)OutgoingPacket.Data.Update.Data, &destSize, LZOWorkMem);
-                SOSendTo(gSocket, &OutgoingPacket, sizeof(Header) + sizeof(int) + destSize, 0, &sConnectAddr);
+                memcpy(OutgoingPacket.Data.Update.Data, gFrameBufferCompressed + i, FB_SEGMENT_SIZE);
+                SOSendTo(gSocket, &OutgoingPacket, sizeof(Header) + sizeof(int) + FB_SEGMENT_SIZE, 0, &sConnectAddr);
             }
             // send timestamp packet
             OutgoingPacket.Head.PacketType = TIMESTAMP_PACKET;
@@ -195,8 +200,6 @@ static void VIFlushHook() {
     memcpy(gFrameBuffer, (void *)sOffset, gFrameSize);
     // do original
     VIFlush();
-    // clear cache
-    DCFlushRange(gFrameBuffer, sizeof(gFrameBuffer));
     // we're ready to send our frame
     gFrameReady = 1;
 }
